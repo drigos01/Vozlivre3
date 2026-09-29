@@ -4,11 +4,12 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { GoogleGenAI } from '@google/genai';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
-import { extractArticleFromUrl, generateReportageScript } from './reportageService';
+import { extractArticleFromUrl, generateReportageScript, cleanCaptionText } from './reportageService';
 import { generateNarrativeVideoScript, searchRealWebMedia } from './narrativeService';
 import { WhatsAppVideoJob, VOICE_CATALOG } from './whatsappService';
 import { ExtractedArticle } from '../types';
 import { geminiKeyManager } from './geminiKeyManager';
+import { generateSrtFromText } from '../utils/audio';
 
 const execFileAsync = promisify(execFile);
 
@@ -408,34 +409,159 @@ async function normalizeImageBufferToJpeg(buf: Buffer, destJpegPath: string): Pr
 }
 
 /**
- * Downloads a media file with timeout, validates Content-Type and binary signature,
- * and normalizes the image to a guaranteed valid JPEG file.
+ * Extracts a real direct media URL (decodes proxy URLs if necessary)
  */
-async function downloadMediaToLocalFile(url: string, destPath: string): Promise<boolean> {
+function resolveDirectMediaUrl(rawUrl?: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (trimmed.includes('url=')) {
+    try {
+      const match = trimmed.match(/url=([^&]+)/);
+      if (match && match[1]) {
+        const decoded = decodeURIComponent(match[1]);
+        if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+          return decoded;
+        }
+      }
+    } catch {}
+  }
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  return '';
+}
+
+/**
+ * Searches real web images using direct links, Wikimedia Commons and Wikipedia APIs
+ */
+async function searchWebImageUrls(query: string, limit = 4): Promise<string[]> {
+  if (!query || !query.trim()) return [];
+  const cleanQ = query
+    .replace(/[\[\]()]/g, ' ')
+    .replace(/^["']|["']$/g, '')
+    .trim()
+    .slice(0, 80);
+
+  if (!cleanQ) return [];
+
+  const foundUrls: string[] = [];
+  const seen = new Set<string>();
+
+  // 1. Direct URL if already present in query
+  const directMatch = cleanQ.match(/https?:\/\/[^\s"'<>]+/i)?.[0];
+  if (directMatch) {
+    foundUrls.push(directMatch);
+    seen.add(directMatch);
+  }
+
+  // 2. Wikimedia Commons API search
+  try {
+    const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
+      cleanQ
+    )}&gsrnamespace=6&prop=imageinfo&iiprop=url|size|thumburl&iiurlwidth=1280&format=json&origin=*&gsrlimit=${limit * 2}`;
+
+    const res = await fetch(commonsUrl, {
+      headers: { 'User-Agent': 'VozLivreBot/1.0 (https://vozlivre.app; contact@vozlivre.app)' },
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (res.ok) {
+      const data: any = await res.json();
+      const pages = data?.query?.pages || {};
+      for (const k of Object.keys(pages)) {
+        const info = pages[k]?.imageinfo?.[0];
+        const imgUrl = info?.thumburl || info?.url;
+        if (
+          imgUrl &&
+          !imgUrl.toLowerCase().endsWith('.svg') &&
+          !imgUrl.toLowerCase().endsWith('.pdf') &&
+          !imgUrl.toLowerCase().endsWith('.ogg') &&
+          !imgUrl.toLowerCase().endsWith('.webm') &&
+          !imgUrl.toLowerCase().endsWith('.mp4')
+        ) {
+          if (!seen.has(imgUrl)) {
+            seen.add(imgUrl);
+            foundUrls.push(imgUrl);
+            if (foundUrls.length >= limit) break;
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Renderer] Aviso na busca Wikimedia para "${cleanQ}":`, err?.message || err);
+  }
+
+  // 3. Wikipedia PT PageImages API
+  if (foundUrls.length < limit) {
+    try {
+      const wikiUrl = `https://pt.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
+        cleanQ
+      )}&gsrlimit=${limit}&prop=pageimages&piprop=original|thumbnail&pithumbsize=1280&format=json&origin=*`;
+
+      const resWiki = await fetch(wikiUrl, {
+        headers: { 'User-Agent': 'VozLivreBot/1.0 (https://vozlivre.app; contact@vozlivre.app)' },
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (resWiki.ok) {
+        const dataWiki: any = await resWiki.json();
+        const pagesWiki = dataWiki?.query?.pages || {};
+        for (const k of Object.keys(pagesWiki)) {
+          const imgUrl = pagesWiki[k]?.original?.source || pagesWiki[k]?.thumbnail?.source;
+          if (imgUrl && !imgUrl.toLowerCase().endsWith('.svg')) {
+            if (!seen.has(imgUrl)) {
+              seen.add(imgUrl);
+              foundUrls.push(imgUrl);
+              if (foundUrls.length >= limit) break;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return foundUrls.slice(0, limit);
+}
+
+/**
+ * Downloads a media file with timeout, validates Content-Type and binary signature,
+ * and normalizes the image to a guaranteed valid JPEG file with explicit scene diagnostics.
+ */
+async function downloadMediaToLocalFile(
+  url: string,
+  destPath: string,
+  sceneLabel = 'Cena'
+): Promise<boolean> {
   if (!url || typeof url !== 'string') return false;
-  const trimmedUrl = url.trim();
+  const trimmedUrl = resolveDirectMediaUrl(url);
   if (!trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) return false;
+
+  console.log(`[${sceneLabel}] URL encontrada: ${trimmedUrl.slice(0, 120)}`);
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6500);
+    const timer = setTimeout(() => controller.abort(), 7500);
 
     const res = await fetch(trimmedUrl, {
       signal: controller.signal,
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        Accept: 'image/avif,image/webp,image/apng,image/jpeg,image/png,image/*,*/*;q=0.8',
       },
     });
     clearTimeout(timer);
 
+    console.log(`[${sceneLabel}] HTTP status: ${res.status}`);
+    const contentType = (res.headers.get('content-type') || '').toLowerCase().trim();
+    console.log(`[${sceneLabel}] Content-Type: ${contentType || 'não informado'}`);
+
     if (!res.ok) {
-      console.warn(`[Renderer] Imagem rejeitada: status HTTP ${res.status} para ${trimmedUrl.slice(0, 60)}`);
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: status HTTP ${res.status}`);
       return false;
     }
 
-    const contentType = (res.headers.get('content-type') || '').toLowerCase().trim();
     if (
       contentType.includes('text/html') ||
       contentType.includes('application/json') ||
@@ -443,25 +569,48 @@ async function downloadMediaToLocalFile(url: string, destPath: string): Promise<
       contentType.includes('application/xml') ||
       contentType.includes('text/xml')
     ) {
-      console.warn(`[Renderer] Imagem rejeitada: content-type inválido (${contentType}) para ${trimmedUrl.slice(0, 60)}`);
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: content-type inválido (${contentType})`);
       return false;
     }
 
     if (contentType && !contentType.startsWith('image/') && !contentType.includes('octet-stream')) {
-      console.warn(`[Renderer] Imagem rejeitada: content-type não é imagem (${contentType}) para ${trimmedUrl.slice(0, 60)}`);
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: content-type não é imagem (${contentType})`);
       return false;
     }
 
     const arrayBuf = await res.arrayBuffer();
     const buf = Buffer.from(arrayBuf);
+    console.log(`[${sceneLabel}] tamanho do arquivo: ${buf.length} bytes`);
+
     if (buf.length < 512) {
-      console.warn(`[Renderer] Imagem rejeitada: buffer muito pequeno (${buf.length} bytes) de ${trimmedUrl.slice(0, 60)}`);
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: buffer muito pequeno (${buf.length} bytes)`);
       return false;
     }
 
-    return await normalizeImageBufferToJpeg(buf, destPath);
+    const format = detectImageFormatFromBuffer(buf);
+    console.log(`[${sceneLabel}] formato detectado: ${format || 'inválido/desconhecido'}`);
+
+    if (!format) {
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: assinatura binária não é de imagem reconhecida`);
+      return false;
+    }
+
+    const success = await normalizeImageBufferToJpeg(buf, destPath);
+    if (success) {
+      console.log(`[${sceneLabel}] imagem aceita`);
+      return true;
+    } else {
+      console.log(`[${sceneLabel}] imagem rejeitada`);
+      console.log(`[${sceneLabel}] motivo da rejeição: falha na normalização para JPEG`);
+      return false;
+    }
   } catch (err: any) {
-    console.warn(`[Renderer] Erro no download de mídia (${trimmedUrl.slice(0, 60)}):`, err?.message || err);
+    console.log(`[${sceneLabel}] imagem rejeitada`);
+    console.log(`[${sceneLabel}] motivo da rejeição: erro de conexão/timeout (${err?.message || err})`);
     return false;
   }
 }
@@ -558,10 +707,10 @@ export async function renderVideoForJob(
 
         if (Array.isArray(scriptData.scenes) && scriptData.scenes.length > 0) {
           scenes = scriptData.scenes.map((sc: any) => ({
-            caption: sc.caption || sc.leadSummary || '',
-            narrationSegment: sc.leadSummary || sc.caption || '',
-            mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
-            searchTag: sc.searchTag,
+            caption: cleanCaptionText(sc.caption || sc.leadSummary || ''),
+            narrationSegment: sc.narrationSegment || sc.leadSummary || sc.caption || '',
+            mediaUrl: resolveDirectMediaUrl(sc.originalUrl || sc.exactMediaUrl || sc.mediaUrl || sc.thumbnailUrl),
+            searchTag: sc.searchTag || sc.caption || title,
             mediaType: sc.mediaType === 'video' ? 'video' : 'image',
           }));
         }
@@ -591,10 +740,10 @@ export async function renderVideoForJob(
 
         if (Array.isArray(narrativeResult.scenes) && narrativeResult.scenes.length > 0) {
           scenes = narrativeResult.scenes.map((sc) => ({
-            caption: sc.caption || sc.narrationSegment || '',
+            caption: cleanCaptionText(sc.caption || sc.narrationSegment || ''),
             narrationSegment: sc.narrationSegment || sc.caption || '',
-            mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
-            searchTag: sc.searchTag || sc.caption,
+            mediaUrl: resolveDirectMediaUrl((sc as any).originalUrl || sc.exactMediaUrl || sc.mediaUrl || sc.thumbnailUrl),
+            searchTag: sc.searchTag || sc.searchQuery || sc.caption || title,
             mediaType: sc.mediaType === 'video' ? 'video' : 'image',
           }));
         }
@@ -650,6 +799,21 @@ export async function renderVideoForJob(
     );
     console.log(`[Renderer] [Job ${jobId}] [Perf] TTS concluído em ${Date.now() - ttsStartTime}ms (Duração do áudio: ${totalDurationSec.toFixed(1)}s)`);
 
+    // 2.1 Generate Synchronized Subtitles (SRT) from narration text
+    let srtPath: string | null = null;
+    if (job.parsed.showSubtitles) {
+      try {
+        const srtContent = generateSrtFromText(fullNarration, totalDurationSec);
+        if (srtContent && srtContent.trim().length > 0) {
+          srtPath = path.join(jobDir, 'subtitles.srt');
+          fs.writeFileSync(srtPath, srtContent, 'utf-8');
+          console.log(`[Renderer] [Job ${jobId}] Legendas sincronizadas geradas em ${srtPath} (${srtContent.split('\n\n').length} segmentos sincronizados)`);
+        }
+      } catch (srtErr: any) {
+        console.warn(`[Renderer] [Job ${jobId}] Erro ao gerar SRT de legendas:`, srtErr?.message || srtErr);
+      }
+    }
+
     // 3. Resolve Media for each scene
     notify(52, 'Obtendo imagens e vídeos para as cenas...');
     const targetWidth = job.parsed.aspectRatio === '16:9' ? 1280 : 720;
@@ -666,6 +830,7 @@ export async function renderVideoForJob(
     for (let idx = 0; idx < scenes.length; idx++) {
       const sceneStartTime = Date.now();
       const sc = scenes[idx];
+      const sceneLabel = `Cena ${idx + 1}`;
       notify(55 + Math.round((idx / scenes.length) * 20), `Preparando mídia da cena ${idx + 1}/${scenes.length}...`);
 
       const sceneImgPath = path.join(jobDir, `scene_${idx}_raw.jpg`);
@@ -678,42 +843,61 @@ export async function renderVideoForJob(
           isVideoClip = true;
           fs.copyFileSync(customMedia.localPath, path.join(jobDir, `scene_${idx}_video.mp4`));
           mediaReady = true;
+          console.log(`[${sceneLabel}] Imagem/vídeo customizado do WhatsApp utilizado com sucesso.`);
         } else {
           try {
             const rawCustomBuf = fs.readFileSync(customMedia.localPath);
             mediaReady = await normalizeImageBufferToJpeg(rawCustomBuf, sceneImgPath);
-            if (!mediaReady) {
-              console.warn(`[Renderer] Imagem personalizada do WhatsApp em ${customMedia.localPath} rejeitada por formato inválido.`);
+            if (mediaReady) {
+              console.log(`[${sceneLabel}] Imagem do WhatsApp validada e aceita.`);
+            } else {
+              console.log(`[${sceneLabel}] imagem rejeitada`);
+              console.log(`[${sceneLabel}] motivo da rejeição: anexo do WhatsApp não é imagem válida`);
             }
           } catch (customErr: any) {
-            console.warn(`[Renderer] Falha ao processar imagem personalizada do WhatsApp:`, customErr?.message || customErr);
+            console.log(`[${sceneLabel}] imagem rejeitada`);
+            console.log(`[${sceneLabel}] motivo da rejeição: falha de leitura (${customErr?.message || customErr})`);
             mediaReady = false;
           }
         }
       }
 
-      // If not custom media, attempt downloading scene mediaUrl
+      // If not custom media, attempt downloading direct scene mediaUrl
       if (!mediaReady && sc.mediaUrl && (sc.mediaUrl.startsWith('http://') || sc.mediaUrl.startsWith('https://'))) {
-        mediaReady = await downloadMediaToLocalFile(sc.mediaUrl, sceneImgPath);
+        mediaReady = await downloadMediaToLocalFile(sc.mediaUrl, sceneImgPath, sceneLabel);
       }
 
-      // If still not ready, search web media (Wikimedia/Wikipedia direct URLs)
+      // If still not ready, try extracted article photos (if reportage mode and available)
+      if (!mediaReady && articleData && Array.isArray(articleData.images) && articleData.images.length > idx) {
+        const artImg = resolveDirectMediaUrl(articleData.images[idx]?.url || articleData.images[idx]?.proxyUrl);
+        if (artImg) {
+          mediaReady = await downloadMediaToLocalFile(artImg, sceneImgPath, sceneLabel);
+        }
+      }
+
+      // If still not ready, search real web images (Wikimedia Commons / Wikipedia)
       if (!mediaReady) {
         try {
           const searchTerms = [sc.searchTag, sc.caption, title].filter(Boolean) as string[];
-          const webItems = await searchRealWebMedia(searchTerms, 3);
-          for (const item of webItems) {
-            if (item.url && (item.url.startsWith('http://') || item.url.startsWith('https://'))) {
-              mediaReady = await downloadMediaToLocalFile(item.url, sceneImgPath);
+          for (const rawTerm of searchTerms) {
+            const cleanTerm = cleanCaptionText(rawTerm);
+            if (!cleanTerm || cleanTerm.length < 3) continue;
+
+            const candidateUrls = await searchWebImageUrls(cleanTerm, 3);
+            for (const candUrl of candidateUrls) {
+              mediaReady = await downloadMediaToLocalFile(candUrl, sceneImgPath, sceneLabel);
               if (mediaReady) break;
             }
+            if (mediaReady) break;
           }
-        } catch {}
+        } catch (searchErr: any) {
+          console.warn(`[${sceneLabel}] Erro ao buscar imagens na web:`, searchErr?.message || searchErr);
+        }
       }
 
-      // Fallback if no image could be downloaded: render a pristine gradient color slide
+      // Fallback if no real image could be downloaded: render a pristine gradient color slide
       if (!mediaReady && !isVideoClip) {
-        console.log(`[Renderer] Acionando fallback visual limpo (generateFallbackCard) para cena ${idx + 1}/${scenes.length}`);
+        console.log(`[${sceneLabel}] fallback usado: generateFallbackCard`);
         const col = colors[idx % colors.length];
         await generateFallbackCard(sceneImgPath, targetWidth, targetHeight, col);
         mediaReady = true;
@@ -722,20 +906,9 @@ export async function renderVideoForJob(
       // Build individual scene video clip with FFmpeg
       const sceneClipPath = path.join(jobDir, `clip_${idx}.mp4`);
 
-      // Subtitle filter (sanitized against quotes, newlines and emojis)
-      let subtitleFilter = '';
-      if (job.parsed.showSubtitles) {
-        const textForSub = escapeDrawText(sc.caption || sc.narrationSegment || '');
-        if (textForSub.length > 0) {
-          const fontSize = job.parsed.aspectRatio === '9:16' ? 26 : 22;
-          const fontArg = HAS_FONT ? `fontfile='${DEFAULT_FONT_PATH}':` : '';
-          subtitleFilter = `,drawtext=${fontArg}text='${textForSub}':fontcolor=white:fontsize=${fontSize}:x=(w-text_w)/2:y=h-140:box=1:boxcolor=black@0.65:boxborderw=8`;
-        }
-      }
-
       if (isVideoClip) {
         const rawVid = path.join(jobDir, `scene_${idx}_video.mp4`);
-        const vidFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
+        const vidFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
         const clipTimeoutMs = Math.max(90000, Math.ceil(sceneDuration * 5000));
         await runFfmpegAsync([
           '-y',
@@ -760,7 +933,7 @@ export async function renderVideoForJob(
         ], clipTimeoutMs);
       } else {
         // Image scene clip with scale & pad, using veryfast + stillimage for 5x speedup and bounded RAM
-        const imgFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
+        const imgFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
         const clipTimeoutMs = Math.max(90000, Math.ceil(sceneDuration * 5000));
         await runFfmpegAsync([
           '-y',
@@ -803,16 +976,25 @@ export async function renderVideoForJob(
       console.log(`[Renderer] [Job ${jobId}] [Perf] Cena ${idx + 1}/${scenes.length} renderizada em ${Date.now() - sceneStartTime}ms`);
     }
 
-    // 4. Single-Pass Unification: Concat Clips + Audio Mux (speech + optional bg bed) directly to final MP4
-    // Eliminates redundant intermediate all_scenes.mp4, cutting disk I/O and render time in half for long videos
+    // 4. Single-Pass Unification: Concat Clips + Audio Mux + Subtitles directly to final MP4
     const muxStartTime = Date.now();
-    notify(82, 'Masterizando áudio e unificando cenas em etapa única...');
+    notify(82, 'Masterizando áudio, aplicando legendas e unificando MP4 final...');
     const concatListPath = path.join(jobDir, 'concat_list.txt');
     const concatContent = sceneClipPaths.map((p) => `file '${p}'`).join('\n');
     fs.writeFileSync(concatListPath, concatContent);
 
     const finalOutputPath = path.join(VIDEOS_DIR, `${jobId}.mp4`);
     const muxTimeoutMs = Math.max(180000, Math.ceil(totalDurationSec * 3000));
+
+    // Subtitle filter configuration
+    const hasSubtitles = Boolean(srtPath && fs.existsSync(srtPath));
+    let subFilterStr = '';
+    if (hasSubtitles && srtPath) {
+      const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+      const fontSize = job.parsed.aspectRatio === '9:16' ? 24 : job.parsed.aspectRatio === '1:1' ? 20 : 22;
+      const marginV = job.parsed.aspectRatio === '9:16' ? 70 : 40;
+      subFilterStr = `subtitles='${escapedSrt}':force_style='FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,MarginV=${marginV},Alignment=2'`;
+    }
 
     if (job.parsed.enableBgMusic) {
       // Generate subtle atmospheric background bed (lavfi harmonic audio) and mix with speech in ONE pass
@@ -831,7 +1013,128 @@ export async function renderVideoForJob(
           bgAudioPath,
         ], 60000);
 
-        // Single-pass Concat + Dual Audio Mix (speech + bg music) directly to finalOutputPath
+        if (hasSubtitles) {
+          // Concat + Subtitle Burn + Dual Audio Mix (speech + bg music)
+          await runFfmpegAsync([
+            '-y',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-i',
+            tempAudioPath,
+            '-i',
+            bgAudioPath,
+            '-filter_complex',
+            `[0:v]${subFilterStr}[vout]; [1:a]volume=1.0[v1]; [2:a]volume=0.08[v2]; [v1][v2]amix=inputs=2:duration=first[aout]`,
+            '-map',
+            '[vout]',
+            '-map',
+            '[aout]',
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            '-shortest',
+            finalOutputPath,
+          ], muxTimeoutMs);
+          console.log(`[Renderer] [Job ${jobId}] Legendas sincronizadas queimadas no vídeo final MP4 com mixagem de áudio.`);
+        } else {
+          // Fast stream-copy without subtitles
+          await runFfmpegAsync([
+            '-y',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-i',
+            tempAudioPath,
+            '-i',
+            bgAudioPath,
+            '-filter_complex',
+            '[1:a]volume=1.0[v1]; [2:a]volume=0.08[v2]; [v1][v2]amix=inputs=2:duration=first[aout]',
+            '-map',
+            '0:v',
+            '-map',
+            '[aout]',
+            '-c:v',
+            'copy',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            '-shortest',
+            finalOutputPath,
+          ], muxTimeoutMs);
+        }
+      } catch (muxBgErr) {
+        console.warn('[Renderer] Fallback para mixagem direta sem trilha de fundo:', muxBgErr);
+        if (hasSubtitles) {
+          await runFfmpegAsync([
+            '-y',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-i',
+            tempAudioPath,
+            '-vf',
+            subFilterStr,
+            '-map',
+            '0:v',
+            '-map',
+            '1:a',
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            '-shortest',
+            finalOutputPath,
+          ], muxTimeoutMs);
+          console.log(`[Renderer] [Job ${jobId}] Legendas sincronizadas queimadas no vídeo final MP4.`);
+        } else {
+          await runFfmpegAsync([
+            '-y',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-i',
+            tempAudioPath,
+            '-c:v',
+            'copy',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            '-shortest',
+            finalOutputPath,
+          ], muxTimeoutMs);
+        }
+      }
+    } else {
+      if (hasSubtitles) {
+        // Concat + Subtitle Burn + Speech Audio
         await runFfmpegAsync([
           '-y',
           '-f',
@@ -842,16 +1145,18 @@ export async function renderVideoForJob(
           concatListPath,
           '-i',
           tempAudioPath,
-          '-i',
-          bgAudioPath,
-          '-filter_complex',
-          '[1:a]volume=1.0[v1]; [2:a]volume=0.08[v2]; [v1][v2]amix=inputs=2:duration=first[aout]',
+          '-vf',
+          subFilterStr,
           '-map',
           '0:v',
           '-map',
-          '[aout]',
+          '1:a',
           '-c:v',
-          'copy',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-pix_fmt',
+          'yuv420p',
           '-c:a',
           'aac',
           '-b:a',
@@ -859,8 +1164,9 @@ export async function renderVideoForJob(
           '-shortest',
           finalOutputPath,
         ], muxTimeoutMs);
-      } catch (muxBgErr) {
-        console.warn('[Renderer] Fallback para mixagem direta sem trilha de fundo:', muxBgErr);
+        console.log(`[Renderer] [Job ${jobId}] Legendas sincronizadas queimadas no vídeo final MP4.`);
+      } else {
+        // Fast stream-copy without subtitles
         await runFfmpegAsync([
           '-y',
           '-f',
@@ -881,27 +1187,6 @@ export async function renderVideoForJob(
           finalOutputPath,
         ], muxTimeoutMs);
       }
-    } else {
-      // Single-pass Concat + Speech Audio Mux directly to finalOutputPath
-      await runFfmpegAsync([
-        '-y',
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        concatListPath,
-        '-i',
-        tempAudioPath,
-        '-c:v',
-        'copy',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        '-shortest',
-        finalOutputPath,
-      ], muxTimeoutMs);
     }
     console.log(`[Renderer] [Job ${jobId}] [Perf] Concatenação e mixagem final em etapa única concluída em ${Date.now() - muxStartTime}ms`);
 
